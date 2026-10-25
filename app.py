@@ -1,4 +1,5 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -478,19 +479,30 @@ div[data-baseweb="input"] input::placeholder {
 </style>
 """, unsafe_allow_html=True)
 
-
 # ============================================================
 # STATE
 # ============================================================
 
+@st.cache_resource
+def get_chat_executor():
+    # Keep a small worker pool alive across Streamlit reruns.
+    # The worker performs the slow HTTP request while the UI remains responsive.
+    return ThreadPoolExecutor(max_workers=2)
+
+CHAT_EXECUTOR = get_chat_executor()
+
 def clear_session():
+    pending = st.session_state.get("pending_job")
+    if pending is not None and not pending.done():
+        pending.cancel()
+
     st.session_state.logged_in = False
     st.session_state.role = None
     st.session_state.employee_id = None
     st.session_state.name = None
     st.session_state.token = None
     st.session_state.messages = []
-
+    st.session_state.pending_job = None
 
 for key, default in {
     "logged_in": False,
@@ -499,11 +511,10 @@ for key, default in {
     "name": None,
     "token": None,
     "messages": [],
-    "pending_question": None,
+    "pending_job": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
-
 
 # ============================================================
 # HELPERS
@@ -528,9 +539,7 @@ def kb_counts():
         "policies": count_rows("policies_approved.csv"),
         "faqs": count_rows("hr_faq_approved_final.csv"),
         "rbac": count_rows("rbac_rules.csv"),
-        "contacts": count_rows("contacts.csv"),
     }
-
 
 def confidence_html(confidence, label):
     if confidence is None or label in (None, "", "Not applicable"):
@@ -562,35 +571,84 @@ def confidence_html(confidence, label):
         f'</div>'
     )
 
-
 def display_sources(sources):
     if not sources:
         return
 
-    st.markdown('<div class="sources-label">Retrieved sources</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sources-label">Evidence & sources</div>',
+        unsafe_allow_html=True,
+    )
 
     for source in sources:
-        if source.get("type") == "rbac":
+        source_type = source.get("type", "source")
+        if source_type == "rbac":
             title = (
                 f'{source.get("rule_id", "RBAC")} · '
                 f'{source.get("data_or_action", "Access rule")}'
             )
-            citation = source.get("citation", "")
+            subtitle = source.get("citation", "")
+        elif source_type == "contact":
+            title = source.get("citation", "HR Contact Directory")
+            subtitle = source.get("contact_id", "")
+        elif source_type == "faq":
+            title = source.get("citation", "HR FAQ")
+            subtitle = source.get("section", "")
         else:
-            title = source.get("citation", "HR source")
-            citation = ""
+            title = source.get("citation", "HR Policy")
+            subtitle = source.get("section", "")
 
         st.markdown(
-            f'<div class="source-box"><b>{title}</b>'
-            f'{"<br>" + citation if citation else ""}</div>',
+            f'<div class="source-box">'
+            f'<b>{title}</b>'
+            f'{"<br><span style=\"color:#71879e;\">" + subtitle + "</span>" if subtitle else ""}'
+            f'</div>',
             unsafe_allow_html=True,
         )
-
 
 def render_message(message):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
+        status = message.get("status")
+        if status == "thinking":
+            st.markdown(
+                '<div style="color:#9bb1c8;font-size:12px;margin-top:4px;">'
+                '<span style="display:inline-block;animation:hrpulse 1.2s infinite;">'
+                '● ● ●'
+                '</span> Retrieving authorized evidence and preparing your answer…'
+                '</div>'
+                '<style>@keyframes hrpulse{0%,100%{opacity:.3}50%{opacity:1}}</style>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        if status == "error":
+            st.markdown(
+                '<div class="confidence conf-low">'
+                '⚠ Request could not be completed'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        if status == "escalated":
+            st.markdown(
+                '<div class="confidence conf-medium">'
+                '↗ Human HR escalation · retrieval and Gemini bypassed'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        topics = message.get("sensitive_topics") or []
+        if topics:
+            topic_text = ", ".join(str(topic).title() for topic in topics)
+            st.markdown(
+                f'<div class="confidence conf-medium">'
+                f'⚠ Sensitive topic · {topic_text}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         confidence = confidence_html(
             message.get("confidence"),
@@ -599,58 +657,29 @@ def render_message(message):
         if confidence:
             st.markdown(confidence, unsafe_allow_html=True)
 
-        if message.get("status") == "escalated":
-            st.markdown(
-                '<div class="confidence conf-medium">'
-                '↗ Human HR escalation'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
         display_sources(message.get("sources", []))
 
-
-def send_question(question):
-    """Send a question to the real FastAPI backend."""
-    question = (question or "").strip()
-    if not question:
-        return
-
-    st.session_state.messages.append(
-        {"role": "user", "content": question}
-    )
-
+def _chat_request_worker(question, history, token):
+    """Run the slow FastAPI request outside the Streamlit UI thread."""
     try:
         response = requests.post(
             f"{BACKEND_URL}/chat",
             headers={
-                "Authorization": f"Bearer {st.session_state.token}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={"question": question},
-            timeout=30,
+            json={
+                "question": question,
+                "history": history,
+            },
+            timeout=45,
         )
 
         if response.status_code == 200:
-            data = response.json()
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": data.get(
-                    "answer",
-                    "The HR backend returned no answer.",
-                ),
-                "confidence": data.get("confidence"),
-                "confidence_label": data.get("confidence_label"),
-                "sources": data.get("sources", []),
-                "status": data.get("status"),
-            })
-            return
-
-        if response.status_code == 401:
-            clear_session()
-            st.error("Your session has expired. Please sign in again.")
-            st.rerun()
+            return {
+                "ok": True,
+                "data": response.json(),
+            }
 
         try:
             detail = response.json().get(
@@ -660,18 +689,182 @@ def send_question(question):
         except Exception:
             detail = f"Backend error ({response.status_code})."
 
-        st.error(detail)
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "detail": detail,
+        }
 
     except requests.exceptions.ConnectionError:
-        st.error(
-            "Cannot connect to the HR backend. "
-            "Make sure FastAPI is running on port 8001."
-        )
-    except requests.exceptions.Timeout:
-        st.error("The HR backend took too long to respond.")
-    except Exception as exc:
-        st.error(f"Chat error: {exc}")
+        return {
+            "ok": False,
+            "status_code": None,
+            "detail": (
+                "Cannot connect to the HR backend. "
+                "Make sure FastAPI is running on port 8001."
+            ),
+        }
 
+    except requests.exceptions.Timeout:
+        return {
+            "ok": False,
+            "status_code": None,
+            "detail": "The HR backend took too long to respond.",
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "detail": f"Chat error: {exc}",
+        }
+
+def queue_question(question):
+    """Immediately put the user message on screen and start the backend job."""
+    question = (question or "").strip()
+    if not question:
+        return False
+
+    pending_job = st.session_state.get("pending_job")
+    if pending_job is not None and not pending_job.done():
+        return False
+
+    # Capture history BEFORE adding the new question.
+    history = [
+        {"role": item.get("role"), "content": item.get("content", "")}
+        for item in st.session_state.messages[-6:]
+        if item.get("role") in {"user", "assistant"}
+        and item.get("status") != "thinking"
+    ]
+
+    # This is rendered immediately in the current Streamlit run.
+    st.session_state.messages.append(
+        {"role": "user", "content": question}
+    )
+
+    # Show an assistant placeholder while Gemini/backend work happens.
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": "Thinking…",
+            "status": "thinking",
+        }
+    )
+
+    st.session_state.pending_job = CHAT_EXECUTOR.submit(
+        _chat_request_worker,
+        question,
+        history,
+        st.session_state.token,
+    )
+
+    return True
+
+def finish_pending_question():
+    """Collect a completed background job and replace the thinking placeholder."""
+    job = st.session_state.get("pending_job")
+    if job is None or not job.done():
+        return
+
+    try:
+        result = job.result()
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status_code": None,
+            "detail": f"Chat error: {exc}",
+        }
+
+    # Remove the completed job before any rerun/session transition.
+    st.session_state.pending_job = None
+
+    # Find the current thinking placeholder.
+    thinking_index = None
+    for index in range(len(st.session_state.messages) - 1, -1, -1):
+        message = st.session_state.messages[index]
+        if message.get("role") == "assistant" and message.get("status") == "thinking":
+            thinking_index = index
+            break
+
+    if thinking_index is None:
+        return
+
+    if result.get("ok"):
+        data = result.get("data", {})
+        st.session_state.messages[thinking_index] = {
+            "role": "assistant",
+            "content": data.get(
+                "answer",
+                "The HR backend returned no answer.",
+            ),
+            "confidence": data.get("confidence"),
+            "confidence_label": data.get("confidence_label"),
+            "sources": data.get("sources", []),
+            "status": data.get("status"),
+            "sensitive_topics": data.get("sensitive_topics", []),
+            "contact_id": data.get("contact_id"),
+        }
+        return
+
+    status_code = result.get("status_code")
+    detail = result.get("detail", "The HR backend could not answer the request.")
+
+    if status_code == 401:
+        st.session_state.messages[thinking_index] = {
+            "role": "assistant",
+            "content": "Your session has expired. Please sign in again.",
+            "status": "error",
+        }
+        st.session_state._session_expired = True
+        return
+
+    st.session_state.messages[thinking_index] = {
+        "role": "assistant",
+        "content": detail,
+        "status": "error",
+    }
+
+def render_conversation_fragment():
+    """Poll the background job without blocking the main Streamlit page."""
+    finish_pending_question()
+
+    with st.container(height=520, border=True):
+        if not st.session_state.messages:
+            st.markdown(
+                '<div class="welcome-card">'
+                '<div class="welcome-title">👋 Welcome, '
+                f'{st.session_state.name.split()[0]}.</div>'
+                '<div class="welcome-copy">'
+                'Your HR assistant is ready. Ask a policy question below '
+                'and I will retrieve the authorized evidence for your role.'
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        for message in st.session_state.messages:
+            render_message(message)
+
+@st.fragment(run_every="1s")
+def conversation_fragment():
+    render_conversation_fragment()
+
+def fetch_admin_metrics():
+    if st.session_state.role != "hr":
+        return None
+
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/admin/metrics",
+            headers={"Authorization": f"Bearer {st.session_state.token}"},
+            timeout=8,
+        )
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+
+    return None
 
 # ============================================================
 # LOGIN
@@ -791,12 +984,15 @@ if not st.session_state.logged_in:
             unsafe_allow_html=True,
         )
 
-
 # ============================================================
 # DASHBOARD / CHAT
 # ============================================================
 
 else:
+    if st.session_state.pop("_session_expired", False):
+        clear_session()
+        st.rerun()
+
     counts = kb_counts()
 
     # Top bar
@@ -833,7 +1029,7 @@ else:
         '<span class="pill">Role-aware</span>'
         '<span class="pill">Region-aware</span>'
         '<span class="pill">Approved KB only</span>'
-        '<span class="pill">Confidence scoring</span>'
+        '<span class="pill">Evidence-based confidence</span>'
         '</div>'
         '</div>',
         unsafe_allow_html=True,
@@ -867,6 +1063,9 @@ else:
             )
 
     # Quick questions + how it works
+    pending_job = st.session_state.get("pending_job")
+    chat_busy = pending_job is not None and not pending_job.done()
+
     quick_col, how_col = st.columns([1.35, 1], gap="large")
 
     with quick_col:
@@ -884,21 +1083,17 @@ else:
                 "How many annual leave days do I get?",
                 key="q1",
                 use_container_width=True,
+                disabled=chat_busy,
             ):
-                st.session_state.pending_question = (
-                    "How many annual leave days do I get?"
-                )
-                st.rerun()
+                queue_question("How many annual leave days do I get?")
         with q2:
             if st.button(
                 "Can I carry forward unused annual leave?",
                 key="q2",
                 use_container_width=True,
+                disabled=chat_busy,
             ):
-                st.session_state.pending_question = (
-                    "Can I carry forward unused annual leave?"
-                )
-                st.rerun()
+                queue_question("Can I carry forward unused annual leave?")
 
         q3, q4 = st.columns(2)
         with q3:
@@ -906,21 +1101,17 @@ else:
                 "Who is authorized to approve my leave?",
                 key="q3",
                 use_container_width=True,
+                disabled=chat_busy,
             ):
-                st.session_state.pending_question = (
-                    "Who is authorized to approve my leave?"
-                )
-                st.rerun()
+                queue_question("Who is authorized to approve my leave?")
         with q4:
             if st.button(
                 "What is the sick leave policy?",
                 key="q4",
                 use_container_width=True,
+                disabled=chat_busy,
             ):
-                st.session_state.pending_question = (
-                    "What is the sick leave policy?"
-                )
-                st.rerun()
+                queue_question("What is the sick leave policy?")
 
     with how_col:
         st.markdown(
@@ -931,7 +1122,7 @@ else:
             '<span style="color:#8fa6bd;">Only policy and FAQ data your role can access.</span></div></div>'
             '<div class="step"><div class="step-num">2</div>'
             '<div class="step-text"><b>Rank the strongest sources</b><br>'
-            '<span style="color:#8fa6bd;">Hybrid lexical retrieval finds the most relevant evidence.</span></div></div>'
+            '<span style="color:#8fa6bd;">Local vector search + keyword reranking finds the strongest evidence.</span></div></div>'
             '<div class="step"><div class="step-num">3</div>'
             '<div class="step-text"><b>Generate a grounded answer</b><br>'
             '<span style="color:#8fa6bd;">Gemini answers using the authorized context.</span></div></div>'
@@ -948,33 +1139,78 @@ else:
         unsafe_allow_html=True,
     )
 
-    with st.container(height=520, border=True):
-        if not st.session_state.messages:
+    # The conversation is a fragment so it can refresh independently while
+    # the backend/Gemini request runs in a worker thread.
+    conversation_fragment()
+
+    # Real chat input. Disable it while a request is running so one click
+    # cannot accidentally create several simultaneous requests.
+    question = st.chat_input(
+        "Ask an HR policy question...",
+        disabled=chat_busy,
+    )
+
+    if question and not chat_busy:
+        queue_question(question)
+
+    # Quick-question buttons use the same queue and are disabled while busy.
+    # The page response is returned immediately with the user's message and
+    # a "Thinking…" placeholder; the fragment polls for the final answer.
+
+# ============================================================
+# HR ADMIN INSIGHTS
+# ============================================================
+
+if st.session_state.logged_in and st.session_state.role == "hr":
+    metrics = fetch_admin_metrics()
+
+    st.markdown(
+        '<div class="section-title">HR Admin Insights</div>'
+        '<div class="section-subtitle">'
+        'Operational metrics from the local privacy-aware audit log.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if metrics:
+        metric_cols = st.columns(4)
+        admin_items = [
+            ("Questions", metrics.get("total_questions", 0)),
+            ("Escalations", metrics.get("escalations", 0)),
+            ("Sensitive events", metrics.get("sensitive_events", 0)),
+            ("Low-confidence", metrics.get("low_confidence", 0)),
+        ]
+
+        for col, (label, value) in zip(metric_cols, admin_items):
+            with col:
+                st.markdown(
+                    f'<div class="stat-card">'
+                    f'<div class="stat-label">{label}</div>'
+                    f'<div class="stat-number">{value}</div>'
+                    f'<div class="stat-caption">Local audit metrics</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        sensitive_topics = metrics.get("sensitive_topics", {})
+        if sensitive_topics:
+            topics = sorted(
+                sensitive_topics.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
+
             st.markdown(
-                '<div class="welcome-card">'
-                '<div class="welcome-title">👋 Welcome, '
-                f'{st.session_state.name.split()[0]}.</div>'
-                '<div class="welcome-copy">'
-                'Your HR assistant is ready. Ask a policy question below '
-                'and I will retrieve the authorized evidence for your role.'
-                '</div>'
-                '</div>',
+                '<div class="info-card" style="margin-top:16px;">'
+                '<div class="access-title">Sensitive topic routing</div>'
+                + "".join(
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding:9px 0;border-bottom:1px solid rgba(154,193,228,.10);">'
+                    f'<span>{topic.title()}</span><b>{count}</b></div>'
+                    for topic, count in topics
+                )
+                + '</div>',
                 unsafe_allow_html=True,
             )
-
-        for message in st.session_state.messages:
-            render_message(message)
-
-    # Real chat input
-    question = st.chat_input("Ask an HR policy question...")
-
-    # A quick-question click gets processed here.
-    if st.session_state.pending_question:
-        pending = st.session_state.pending_question
-        st.session_state.pending_question = None
-        send_question(pending)
-        st.rerun()
-
-    if question:
-        send_question(question)
-        st.rerun()
+    else:
+        st.info("No audit events have been recorded yet.")

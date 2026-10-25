@@ -1,18 +1,22 @@
 from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 import csv
 import re
 import os
+import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import jwt
 from google import genai
+from google.genai import types
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-
-
-
-
+from backend.vector_store import LocalVectorStore
 
 # ============================================================
 
@@ -22,17 +26,9 @@ from pydantic import BaseModel
 
 # ============================================================
 
-
-
 app = FastAPI(title="HR Helpdesk API")
 
-
-
 BASE_DIR = Path(__file__).resolve().parent
-
-PROJECT_DIR = BASE_DIR.parent
-
-
 
 POLICIES_FILE = BASE_DIR / "policies_approved.csv"
 
@@ -40,8 +36,8 @@ FAQ_FILE = BASE_DIR / "hr_faq_approved_final.csv"
 
 RBAC_FILE = BASE_DIR / "rbac_rules.csv"
 CONTACTS_FILE = BASE_DIR / "contacts.csv"
-
-
+VECTOR_DB_DIR = BASE_DIR / "vector_db"
+AUDIT_LOG_FILE = BASE_DIR / "audit_logs.jsonl"
 
 SECRET_KEY = "change-this-before-production"
 
@@ -57,18 +53,13 @@ TOKEN_EXPIRE_MINUTES = 60
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
-
-
-
-
+VECTOR_STORE = LocalVectorStore(VECTOR_DB_DIR, POLICIES_FILE, FAQ_FILE)
 
 # ============================================================
 
 # DEMO EMPLOYEES
 
 # ============================================================
-
-
 
 EMPLOYEES = {
 
@@ -146,33 +137,30 @@ EMPLOYEES = {
 
 }
 
-
-
-
-
 # ============================================================
 
 # SOURCE-GROUNDED SENSITIVE TOPICS
 
 # ============================================================
 
-
-
 SENSITIVE_PATTERNS = {
     "harassment": r"\bharass(?:ment|ed|ing)?\b",
     "sexual harassment": r"\bsexual\s+harass(?:ment|ed|ing)?\b",
     "retaliation": r"\bretaliat(?:ion|ed|ing)\b",
     "termination": r"\b(?:termination|terminated|terminate|fired|firing|laid\s+off|layoff)\b",
-    "medical": r"\b(?:medical|diagnosis|diagnosed|medical\s+condition)\b",
-    "legal": r"\blegal\b",
+    "legal": r"\b(?:legal|lawsuit|legal\s+action|attorney|lawyer)\b",
     "whistleblowing": r"\bwhistleblow(?:ing|er)?\b",
     "mental health": r"\bmental[\s-]+health\b",
+    "bullying": r"\bbull(?:y|ied|ying)\b",
+    "discrimination": r"\bdiscriminat(?:e|ed|ion|ing)\b",
+    "unwanted touching": r"\bunwanted\s+touch(?:ing)?\b",
+    "stalking": r"\bstalk(?:ing|ed)\b",
+    "coercion": r"\bcoerc(?:ion|ed|ive)\b",
+    "blackmail": r"\bblackmail(?:ed|ing)?\b",
+    "threat": r"\bthreat(?:en(?:ed|ing))?\b",
+    "wrongful termination": r"\bwrongful\s+termination\b",
+    "medical condition": r"\b(?:diagnos(?:is|ed)|medical\s+condition|treatment|disability|health\s+condition)\b",
 }
-
-
-
-
-
 
 # ============================================================
 
@@ -180,25 +168,15 @@ SENSITIVE_PATTERNS = {
 
 # ============================================================
 
-
-
 class LoginRequest(BaseModel):
 
     employee_id: str
 
     password: str
 
-
-
-
-
 class ChatRequest(BaseModel):
-
     question: str
-
-
-
-
+    history: list[dict] = []
 
 # ============================================================
 
@@ -206,39 +184,23 @@ class ChatRequest(BaseModel):
 
 # ============================================================
 
-
-
 def load_csv(path: Path):
 
     if not path.exists():
 
         return []
 
-
-
     with open(path, newline="", encoding="utf-8-sig") as file:
 
         return list(csv.DictReader(file))
-
-
-
-
 
 def load_policies():
 
     return load_csv(POLICIES_FILE)
 
-
-
-
-
 def load_faq():
 
     return load_csv(FAQ_FILE)
-
-
-
-
 
 def load_contacts():
 
@@ -256,15 +218,9 @@ def load_contacts():
         {"contact_id": "CONTACT-HR-HELPDESK", "team": "HR Helpdesk", "email": "", "phones": "", "hours": "TO_BE_DEFINED_BY_MANAGEMENT", "response_sla": "TO_BE_DEFINED_BY_MANAGEMENT"},
     ]
 
-
-
 def load_rbac_rules():
 
     return load_csv(RBAC_FILE)
-
-
-
-
 
 # ============================================================
 
@@ -272,13 +228,7 @@ def load_rbac_rules():
 
 # ============================================================
 
-
-
 security = HTTPBearer()
-
-
-
-
 
 def create_access_token(employee_id: str, employee: dict):
 
@@ -287,8 +237,6 @@ def create_access_token(employee_id: str, employee: dict):
         minutes=TOKEN_EXPIRE_MINUTES
 
     )
-
-
 
     token_data = {
 
@@ -304,13 +252,7 @@ def create_access_token(employee_id: str, employee: dict):
 
     }
 
-
-
     return jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
-
-
-
-
 
 def get_current_user(
 
@@ -319,8 +261,6 @@ def get_current_user(
 ):
 
     token = credentials.credentials
-
-
 
     try:
 
@@ -334,15 +274,11 @@ def get_current_user(
 
         )
 
-
-
         employee_id = payload.get("employee_id")
 
         role = payload.get("role")
 
         region = payload.get("region")
-
-
 
         if not employee_id or not role or not region:
 
@@ -353,8 +289,6 @@ def get_current_user(
                 detail="Invalid authentication token.",
 
             )
-
-
 
         return {
 
@@ -367,8 +301,6 @@ def get_current_user(
             "region": region,
 
         }
-
-
 
     except jwt.ExpiredSignatureError:
 
@@ -390,17 +322,11 @@ def get_current_user(
 
         )
 
-
-
-
-
 # ============================================================
 
 # BASIC ROLE + REGION ACCESS CHECK
 
 # ============================================================
-
-
 
 def allowed_for_user(row: dict, role: str, region: str):
 
@@ -414,8 +340,6 @@ def allowed_for_user(row: dict, role: str, region: str):
 
     }
 
-
-
     allowed_regions = {
 
         item.strip().lower()
@@ -426,8 +350,6 @@ def allowed_for_user(row: dict, role: str, region: str):
 
     }
 
-
-
     role_allowed = (
 
         "all" in allowed_roles
@@ -435,8 +357,6 @@ def allowed_for_user(row: dict, role: str, region: str):
         or role.lower() in allowed_roles
 
     )
-
-
 
     region_allowed = (
 
@@ -446,13 +366,7 @@ def allowed_for_user(row: dict, role: str, region: str):
 
     )
 
-
-
     return role_allowed and region_allowed
-
-
-
-
 
 def filter_policy_access(rows, role, region):
 
@@ -464,8 +378,6 @@ def filter_policy_access(rows, role, region):
 
     """
 
-
-
     return [
 
         row
@@ -476,17 +388,11 @@ def filter_policy_access(rows, role, region):
 
     ]
 
-
-
-
-
 # ============================================================
 
 # SENSITIVE QUERY DETECTION
 
 # ============================================================
-
-
 
 def detect_sensitive_topic(question: str):
     """
@@ -503,14 +409,11 @@ def detect_sensitive_topic(question: str):
 
     return matched_terms
 
-
 # ============================================================
 
 # RBAC RULE LOOKUP
 
 # ============================================================
-
-
 
 def get_rbac_rules_for_role(role: str):
 
@@ -530,15 +433,9 @@ def get_rbac_rules_for_role(role: str):
 
     """
 
-
-
     rules = load_rbac_rules()
 
-
-
     matching_rules = []
-
-
 
     for rule in rules:
 
@@ -552,19 +449,11 @@ def get_rbac_rules_for_role(role: str):
 
         }
 
-
-
         if role.lower() in allowed_roles:
 
             matching_rules.append(rule)
 
-
-
     return matching_rules
-
-
-
-
 
 def is_rbac_question(question: str):
 
@@ -584,11 +473,7 @@ def is_rbac_question(question: str):
 
     """
 
-
-
     q = question.lower()
-
-
 
     rbac_terms = [
 
@@ -670,13 +555,7 @@ def is_rbac_question(question: str):
 
     ]
 
-
-
     return any(term in q for term in rbac_terms)
-
-
-
-
 
 RBAC_INTENT_KEYWORDS = {
 
@@ -826,10 +705,6 @@ RBAC_INTENT_KEYWORDS = {
 
 }
 
-
-
-
-
 def score_rbac_rule(question: str, rule: dict):
 
     """
@@ -844,13 +719,9 @@ def score_rbac_rule(question: str, rule: dict):
 
     """
 
-
-
     q = question.lower()
 
     rule_key = rule.get("rule_key", "").lower()
-
-
 
     # Strong signal: explicit intent mapping.
 
@@ -859,8 +730,6 @@ def score_rbac_rule(question: str, rule: dict):
         if key == rule_key and any(phrase in q for phrase in phrases):
 
             return 100
-
-
 
     # Special handling for broad access questions.
 
@@ -878,8 +747,6 @@ def score_rbac_rule(question: str, rule: dict):
 
             return 100
 
-
-
     if rule_key == "team_attendance_leave":
 
         if (
@@ -893,8 +760,6 @@ def score_rbac_rule(question: str, rule: dict):
         ):
 
             return 80
-
-
 
     if rule_key == "disciplinary_files":
 
@@ -910,13 +775,9 @@ def score_rbac_rule(question: str, rule: dict):
 
             return 100
 
-
-
     # Fallback keyword overlap.
 
     question_words = tokenize(question)
-
-
 
     searchable_text = " ".join(
 
@@ -936,17 +797,9 @@ def score_rbac_rule(question: str, rule: dict):
 
     )
 
-
-
     rule_words = tokenize(searchable_text)
 
-
-
     return len(question_words & rule_words)
-
-
-
-
 
 ROLE_REFERENCE_TERMS = {
     "intern": ["intern", "interns", "trainee", "trainees"],
@@ -956,7 +809,6 @@ ROLE_REFERENCE_TERMS = {
     "ceo": ["ceo", "ceos", "executive", "executives", "c-level", "founder", "founders"],
     "hr": ["hr", "human resources", "hr staff", "hr team"],
 }
-
 
 def referenced_roles_in_question(question: str):
     """Return roles explicitly mentioned in an RBAC question."""
@@ -971,7 +823,6 @@ def referenced_roles_in_question(question: str):
                 break
 
     return found
-
 
 def has_privilege_boundary_probe(question: str, current_role: str):
     """
@@ -1007,18 +858,16 @@ def has_privilege_boundary_probe(question: str, current_role: str):
 
     return current_role.lower() not in {"ceo", "hr"}
 
-
 def has_cross_role_rbac_request(question: str, current_role: str):
-    """
-    Detect a request asking one role to disclose another role's
-    permissions. Such requests must not retrieve the other role's rules.
-    """
+    """Block cross-role permission enumeration for non-top-level roles."""
+    current_role = current_role.lower()
+    if current_role in {"ceo", "hr"}:
+        return False
     referenced_roles = referenced_roles_in_question(question)
     return (
-        bool(referenced_roles - {current_role.lower()})
+        bool(referenced_roles - {current_role})
         or has_privilege_boundary_probe(question, current_role)
     )
-
 
 def retrieve_relevant_rbac_rules(question: str, role: str):
 
@@ -1034,11 +883,7 @@ def retrieve_relevant_rbac_rules(question: str, role: str):
 
     """
 
-
-
     authorized_rules = get_rbac_rules_for_role(role)
-
-
 
     scored_rules = [
 
@@ -1048,11 +893,7 @@ def retrieve_relevant_rbac_rules(question: str, role: str):
 
     ]
 
-
-
     scored_rules.sort(key=lambda item: item[0], reverse=True)
-
-
 
     return [
 
@@ -1061,10 +902,6 @@ def retrieve_relevant_rbac_rules(question: str, role: str):
         if score > 0
 
     ]
-
-
-
-
 
 def make_rbac_citation(rule: dict):
 
@@ -1075,10 +912,6 @@ def make_rbac_citation(rule: dict):
         "Standard Company Policy Manual"
 
     )
-
-
-
-
 
 def build_rbac_answer(question: str, role: str, rules: list):
 
@@ -1096,13 +929,9 @@ def build_rbac_answer(question: str, role: str, rules: list):
 
     """
 
-
-
     if not rules:
 
         return None
-
-
 
     role_name = {
 
@@ -1120,15 +949,11 @@ def build_rbac_answer(question: str, role: str, rules: list):
 
     }.get(role, role)
 
-
-
     lines = [
 
         f"Based on the HR access-control rules for the {role_name} role:"
 
     ]
-
-
 
     for rule in rules:
 
@@ -1136,28 +961,17 @@ def build_rbac_answer(question: str, role: str, rules: list):
 
         rule_text = rule.get("rule", "").strip()
 
-
-
         if rule_text:
 
             lines.append(f"- {data_or_action}: {rule_text}")
 
-
-
     return "\n".join(lines)
-
-
-
-
 
 # ============================================================
 
 # SIMPLE RETRIEVAL
 
 # ============================================================
-
-
-
 
 # ============================================================
 # QUERY NORMALIZATION / CONCEPT EXPANSION
@@ -1210,7 +1024,6 @@ QUERY_CONCEPTS = {
     ],
 }
 
-
 def expand_query(question: str) -> str:
     """
     Add policy concepts to natural employee wording before lexical retrieval.
@@ -1232,8 +1045,6 @@ def expand_query(question: str) -> str:
 
     return f"{question} {' '.join(concepts)}"
 
-
-
 def tokenize(text: str):
 
     return set(
@@ -1248,15 +1059,9 @@ def tokenize(text: str):
 
     )
 
-
-
-
-
 def score_row(question: str, row: dict):
 
     question_words = tokenize(question)
-
-
 
     searchable_text = " ".join(
 
@@ -1282,125 +1087,105 @@ def score_row(question: str, row: dict):
 
     )
 
-
-
     row_words = tokenize(searchable_text)
-
-
 
     return len(question_words & row_words)
 
+def build_contextual_query(question: str, history: list[dict] | None = None):
+    """Use a small amount of same-session context to resolve follow-up questions."""
+    question = (question or "").strip()
+    history = history or []
+    previous_user_questions = [
+        str(item.get("content", "")).strip()
+        for item in history
+        if item.get("role") == "user" and str(item.get("content", "")).strip()
+    ][-2:]
+    if not previous_user_questions:
+        return question
+    return question + " Previous questions: " + " | ".join(previous_user_questions)
 
-
-
-
-def retrieve_authorized_context(question: str, role: str, region: str):
-
+def retrieve_authorized_context(
+    question: str,
+    role: str,
+    region: str,
+    history: list[dict] | None = None,
+):
     """
+    Retrieve from a role/region-partitioned local vector index.
 
-    SECURITY ORDER:
-
-
-
-    1. Load policy data
-
-    2. Filter by role + region
-
-    3. ONLY THEN score/retrieve relevant chunks
-
-
-
-    Never retrieve from the unrestricted policy set.
-
+    Authorization is enforced by the partition before semantic retrieval.
+    A lexical score is then used as a lightweight hybrid reranker.
     """
-
-
-
     policies = load_policies()
-
     faq = load_faq()
+    retrieval_question = expand_query(build_contextual_query(question, history))
 
-    # Expand natural wording into policy concepts before lexical retrieval.
-    # Authorization still happens first; this only improves matching.
-    retrieval_question = expand_query(question)
+    try:
+        vector_policies, vector_faq, evidence = VECTOR_STORE.query(
+            retrieval_question,
+            role,
+            region,
+            n=12,
+            policies=policies,
+            faq=faq,
+        )
+    except Exception as exc:
+        print(
+            f"[HR-HELPDESK] Local vector retrieval unavailable: "
+            f"{type(exc).__name__}: {exc}. Falling back to authorized lexical retrieval.",
+            flush=True,
+        )
+        authorized_policies = filter_policy_access(policies, role, region)
+        authorized_faq = filter_policy_access(faq, role, region)
+        scored_policies = sorted(
+            [(score_row(retrieval_question, row), row) for row in authorized_policies],
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        scored_faq = sorted(
+            [(score_row(retrieval_question, row), row) for row in authorized_faq],
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        vector_policies = [row for score, row in scored_policies[:5] if score > 0]
+        vector_faq = [row for score, row in scored_faq[:5] if score > 0]
+        evidence = []
 
+    def hybrid_score(row):
+        lexical = score_row(retrieval_question, row)
+        searchable = " ".join([
+            row.get("policy_name", ""),
+            row.get("section", ""),
+            row.get("section_title", ""),
+            row.get("text", ""),
+            row.get("key_rule", ""),
+            row.get("category", ""),
+            row.get("question", ""),
+            row.get("answer", ""),
+        ])
+        q_words = meaningful_tokens(retrieval_question)
+        r_words = meaningful_tokens(searchable)
+        coverage = len(q_words & r_words) / max(1, len(q_words))
+        return lexical + (coverage * 10)
 
+    vector_policies = sorted(
+        {row.get("chunk_id"): row for row in vector_policies}.values(),
+        key=hybrid_score,
+        reverse=True,
+    )[:5]
+    vector_faq = sorted(
+        {row.get("chunk_id"): row for row in vector_faq}.values(),
+        key=hybrid_score,
+        reverse=True,
+    )[:5]
 
-    authorized_policies = filter_policy_access(
-
-        policies,
-
-        role,
-
-        region,
-
-    )
-
-
-
-    authorized_faq = filter_policy_access(
-
-        faq,
-
-        role,
-
-        region,
-
-    )
-
-
-
-    scored_policies = [
-
-        (score_row(retrieval_question, row), row)
-
-        for row in authorized_policies
-
+    selected_ids = {row.get("chunk_id") for row in vector_policies + vector_faq}
+    selected_evidence = [
+        item for item in evidence
+        if item.get("chunk_id") in selected_ids
     ]
 
-
-
-    scored_faq = [
-
-        (score_row(retrieval_question, row), row)
-
-        for row in authorized_faq
-
-    ]
-
-
-
-    scored_policies.sort(key=lambda item: item[0], reverse=True)
-
-    scored_faq.sort(key=lambda item: item[0], reverse=True)
-
-
-
-    top_policies = [
-
-        row for score, row in scored_policies[:5]
-
-        if score > 0
-
-    ]
-
-
-
-    top_faq = [
-
-        row for score, row in scored_faq[:3]
-
-        if score > 0
-
-    ]
-
-
-
-    return top_policies, top_faq
-
-
-
-
+    return vector_policies, vector_faq, selected_evidence
 
 # ============================================================
 
@@ -1408,51 +1193,14 @@ def retrieve_authorized_context(question: str, role: str, region: str):
 
 # ============================================================
 
-
-
 def make_policy_citation(row):
-
-    policy_name = row.get("policy_name", "Unknown policy")
-
-    section = row.get("section", "")
-
-    version = row.get("version", "")
-
-    effective_date = row.get("effective_date", "")
-
-
-
-    citation = f"{policy_name}"
-
-
-
+    """Create a clean human-facing citation without placeholder metadata."""
+    policy_name = row.get("policy_name", "HR Policy").strip()
+    section = row.get("section", "").strip()
+    citation = policy_name
     if section:
-
-        citation += f" §{section}"
-
-
-
-    if version:
-
-        citation += f" (v{version}"
-
-
-
-        if effective_date:
-
-            citation += f", effective {effective_date}"
-
-
-
-        citation += ")"
-
-
-
+        citation += f" · §{section}"
     return citation
-
-
-
-
 
 # ============================================================
 
@@ -1484,7 +1232,6 @@ def build_grounded_context(policies, faq):
 
     return "\n\n---\n\n".join(context_parts)
 
-
 def generate_grounded_answer(question: str, role: str, policies: list, faq: list):
     """Generate an HR answer using only authorized context."""
 
@@ -1502,7 +1249,14 @@ def generate_grounded_answer(question: str, role: str, policies: list, faq: list
 
     # Create the client at request time so the process always uses the
     # current environment variable.
-    gemini_client = genai.Client(api_key=api_key)
+    #
+    # The frontend currently waits about 45 seconds for /chat, so keep the
+    # Gemini network timeout below that window. This prevents a stalled
+    # provider request from making the whole HR Helpdesk request hang.
+    gemini_client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=35000),
+    )
 
     context = build_grounded_context(policies, faq)
 
@@ -1544,19 +1298,39 @@ Authorized HR policy and FAQ context:
 Answer the employee's question using only the authorized context above.
 """.strip()
 
+    print("[HR-HELPDESK] Gemini call started", flush=True)
+    gemini_started = time.perf_counter()
+
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=user_prompt,
-            config={
-                "system_instruction": system_instruction,
-            },
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                # This application does not use Gemini function tools.
+                # Explicitly disable AFC so the SDK cannot enter an
+                # unnecessary automatic function-calling path.
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
+                temperature=0.2,
+                max_output_tokens=300,
+            ),
         )
     except Exception as exc:
-        # Print the real provider error in the FastAPI terminal so debugging
-        # does not require exposing implementation details to the employee.
-        print(f"Gemini API error: {type(exc).__name__}: {exc}")
+        elapsed = time.perf_counter() - gemini_started
+        print(
+            f"[HR-HELPDESK] Gemini call failed after {elapsed:.2f}s: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
         raise
+
+    elapsed = time.perf_counter() - gemini_started
+    print(
+        f"[HR-HELPDESK] Gemini call completed in {elapsed:.2f}s",
+        flush=True,
+    )
 
     try:
         answer = (response.text or "").strip()
@@ -1570,8 +1344,6 @@ Answer the employee's question using only the authorized context above.
 
     return answer
 
-
-
 # ============================================================
 # CONFIDENCE SCORING
 # ============================================================
@@ -1584,7 +1356,6 @@ STOPWORDS = {
     "get", "have", "has", "can", "please"
 }
 
-
 def meaningful_tokens(text: str):
     return {
         token
@@ -1592,69 +1363,79 @@ def meaningful_tokens(text: str):
         if token not in STOPWORDS and len(token) > 2
     }
 
-
 def calculate_retrieval_confidence(
     question: str,
     policies: list,
     faq: list,
+    evidence: list | None = None,
 ):
-    """
-    Estimate confidence from authorized retrieval strength.
+    """Evidence-support score, not model certainty."""
+    evidence = evidence or []
 
-    This is a retrieval-support score, not model certainty. It is deliberately
-    capped below 100 because lexical retrieval cannot prove factual certainty.
-    """
+    if evidence:
+        similarities = sorted(
+            [float(item.get("similarity", 0.0)) for item in evidence],
+            reverse=True,
+        )
+        top = similarities[0] if similarities else 0.0
+        corroborating = sum(1 for value in similarities if value >= 0.65)
+
+        if top >= 0.84:
+            score = 88
+        elif top >= 0.76:
+            score = 82
+        elif top >= 0.68:
+            score = 74
+        elif top >= 0.60:
+            score = 64
+        elif top >= 0.52:
+            score = 52
+        elif top >= 0.45:
+            score = 40
+        else:
+            score = 25
+
+        if corroborating >= 3:
+            score += 6
+        elif corroborating >= 2:
+            score += 4
+        elif corroborating >= 1:
+            score += 2
+
+        if faq and top >= 0.72:
+            score += 3
+
+        return max(0, min(97, round(score)))
+
     all_rows = list(policies) + list(faq)
-
     if not all_rows:
         return 0
 
-    question_words = meaningful_tokens(expand_query(question))
-    if not question_words:
+    q_words = meaningful_tokens(expand_query(question))
+    if not q_words:
         return 0
 
-    row_scores = []
-
+    coverages = []
     for row in all_rows:
-        searchable_text = " ".join(
-            [
-                row.get("policy_name", ""),
-                row.get("section", ""),
-                row.get("section_title", ""),
-                row.get("text", ""),
-                row.get("key_rule", ""),
-                row.get("category", ""),
-                row.get("question", ""),
-                row.get("answer", ""),
-            ]
-        )
-        row_words = meaningful_tokens(searchable_text)
-        overlap = len(question_words & row_words)
-        coverage = overlap / max(1, len(question_words))
+        searchable = " ".join([
+            row.get("policy_name", ""),
+            row.get("section", ""),
+            row.get("section_title", ""),
+            row.get("text", ""),
+            row.get("key_rule", ""),
+            row.get("category", ""),
+            row.get("question", ""),
+            row.get("answer", ""),
+        ])
+        row_words = meaningful_tokens(searchable)
+        overlap = len(q_words & row_words)
         if overlap:
-            row_scores.append((coverage, overlap))
+            coverages.append(overlap / len(q_words))
 
-    if not row_scores:
+    if not coverages:
         return 0
 
-    row_scores.sort(reverse=True)
-    best_coverage, best_overlap = row_scores[0]
-    supporting_sources = sum(1 for coverage, _ in row_scores if coverage >= 0.25)
-
-    score = 45 + (45 * min(1.0, best_coverage))
-
-    if best_overlap >= 4:
-        score += 4
-    elif best_overlap >= 3:
-        score += 2
-
-    if supporting_sources >= 3:
-        score += 3
-    elif supporting_sources >= 2:
-        score += 2
-
-    return max(0, min(97, round(score)))
-
+    return max(0, min(92, round(40 + (45 * max(coverages)))))
 
 def confidence_label(score: int):
     if score >= 85:
@@ -1665,16 +1446,12 @@ def confidence_label(score: int):
         return "Low"
     return "Very low"
 
-
-
 # ============================================================
 # ESCALATION / CONTACT ROUTING
 # ============================================================
 
-
 def is_escalation_question(question: str):
-    """Detect requests for help, access escalation, or an HR contact."""
-    q = question.lower().strip()
+    q = re.sub(r"\s+", " ", question.lower().strip())
     phrases = [
         "who should i contact", "who do i contact", "who can i contact",
         "who should i ask", "who can help me", "where should i go",
@@ -1690,7 +1467,6 @@ def is_escalation_question(question: str):
     ]
     return any(phrase in q for phrase in phrases)
 
-
 def choose_contact_id(question: str):
     q = question.lower()
     if any(term in q for term in ["payroll", "pay", "salary", "compensation"]):
@@ -1701,34 +1477,20 @@ def choose_contact_id(question: str):
         return "CONTACT-HR-HELPDESK"
     return "CONTACT-HR-OPERATIONS"
 
-
 def get_contact(contact_id: str):
     for contact in load_contacts():
         if contact.get("contact_id", "").strip().upper() == contact_id.upper():
             return contact
     return None
 
+def _clean_contact_value(value: str) -> str:
+    value = (value or "").strip()
+    if not value or "TO_BE_DEFINED_BY_MANAGEMENT" in value.upper():
+        return ""
+    return value
 
-def build_escalation_response(question: str):
-    """Build a grounded escalation response from the contact directory."""
-    contact_id = choose_contact_id(question)
-    contact = get_contact(contact_id)
-
-    if not contact:
-        return {
-            "status": "escalated",
-            "answer": (
-                "Please contact Human Resources through the HR Helpdesk. "
-                "The current contact directory does not contain configured "
-                "email or phone details."
-            ),
-            "contact_id": contact_id,
-            "confidence": 95,
-            "confidence_label": "High",
-            "sources": [],
-        }
-
-    team = contact.get("team", "Human Resources").strip() or "Human Resources"
+def _contact_details(contact: dict):
+    team = _clean_contact_value(contact.get("team")) or "Human Resources"
     details = []
     for label, key in [
         ("Email", "email"),
@@ -1736,31 +1498,61 @@ def build_escalation_response(question: str):
         ("Hours", "hours"),
         ("Response SLA", "response_sla"),
     ]:
-        value = contact.get(key, "").strip()
+        value = _clean_contact_value(contact.get(key))
         if value:
             details.append(f"{label}: {value}")
+    return team, details
 
+def build_contact_response(question: str, status: str = "escalated"):
+    contact_id = choose_contact_id(question)
+    contact = get_contact(contact_id)
+    if not contact:
+        return {
+            "status": status,
+            "answer": "Please contact the HR Helpdesk. The current contact directory does not contain configured contact details yet.",
+            "contact_id": contact_id,
+            "confidence": 95,
+            "confidence_label": "High",
+            "sources": [],
+        }
+
+    team, details = _contact_details(contact)
     if details:
-        answer = f"Please contact {team} for assistance. " + " ".join(details)
+        answer = f"Please contact {team}. " + " · ".join(details)
     else:
         answer = (
             f"Please contact {team} through the HR Helpdesk. "
-            "The contact directory does not yet contain an email or phone number."
+            "The contact directory does not yet contain a configured email or phone number."
         )
 
     return {
-        "status": "escalated",
+        "status": status,
         "answer": answer,
         "contact_id": contact_id,
-        "confidence": 95,
+        "confidence": 96,
         "confidence_label": "High",
         "sources": [{
             "type": "contact",
-            "citation": f"{team} contact directory",
+            "citation": f"{team} · Contact Directory",
             "contact_id": contact_id,
         }],
     }
 
+def build_escalation_response(question: str):
+    return build_contact_response(question, status="escalated")
+
+def build_sensitive_response(question: str, matched_topics: list):
+    response = build_contact_response("contact HR helpdesk", status="escalated")
+    topics = ", ".join(topic.title() for topic in matched_topics)
+    response["answer"] = (
+        f"This question involves a sensitive HR matter ({topics}). "
+        "The HR Helpdesk bot does not provide advice on this type of matter. "
+        + response["answer"]
+    )
+    response["sensitive_topics"] = matched_topics
+    response["confidence"] = None
+    response["confidence_label"] = "Not applicable"
+    return response
 
 def calculate_rbac_confidence(question: str, rules: list):
     """Score confidence in an RBAC answer from explicit rule matching."""
@@ -1799,7 +1591,96 @@ def calculate_rbac_confidence(question: str, rules: list):
 
 # ============================================================
 
+# ============================================================
+# AUDIT LOGGING + HR ADMIN METRICS
+# ============================================================
 
+def log_audit_event(
+    user: dict,
+    question: str,
+    status: str,
+    confidence,
+    sources: list | None = None,
+    sensitive_topics: list | None = None,
+):
+    sensitive_topics = sensitive_topics or []
+    logged_question = "[SENSITIVE QUESTION REDACTED]" if sensitive_topics else question[:500]
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "employee_id": user.get("employee_id"),
+        "role": user.get("role"),
+        "question": logged_question,
+        "status": status,
+        "confidence": confidence,
+        "sensitive": bool(sensitive_topics),
+        "sensitive_topics": sensitive_topics,
+        "source_count": len(sources or []),
+        "sources": [
+            {
+                "type": item.get("type"),
+                "citation": item.get("citation"),
+                "chunk_id": item.get("chunk_id"),
+                "rule_id": item.get("rule_id"),
+            }
+            for item in (sources or [])[:5]
+        ],
+    }
+    try:
+        AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[HR-HELPDESK] Audit log write failed: {type(exc).__name__}: {exc}", flush=True)
+
+def load_audit_events():
+    if not AUDIT_LOG_FILE.exists():
+        return []
+    events = []
+    try:
+        with AUDIT_LOG_FILE.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except Exception:
+        return []
+    return events
+
+def build_admin_metrics():
+    events = load_audit_events()
+    role_counts, status_counts, topic_counts = {}, {}, {}
+    sensitive_count = 0
+    low_confidence_count = 0
+
+    for event in events:
+        role = event.get("role", "unknown")
+        status = event.get("status", "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if event.get("sensitive"):
+            sensitive_count += 1
+        confidence = event.get("confidence")
+        if isinstance(confidence, (int, float)) and confidence < 65:
+            low_confidence_count += 1
+        for topic in event.get("sensitive_topics", []):
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+
+    return {
+        "total_questions": len(events),
+        "escalations": status_counts.get("escalated", 0),
+        "low_confidence": low_confidence_count,
+        "sensitive_events": sensitive_count,
+        "by_role": role_counts,
+        "by_status": status_counts,
+        "sensitive_topics": topic_counts,
+    }
+
+def require_hr(user=Depends(get_current_user)):
+    if user["role"].lower() != "hr":
+        raise HTTPException(status_code=403, detail="HR administrator access required.")
 
 @app.get("/")
 
@@ -1812,10 +1693,6 @@ def root():
         "status": "ok",
 
     }
-
-
-
-
 
 @app.get("/health")
 
@@ -1834,17 +1711,11 @@ def health():
 
     }
 
-
-
-
-
 @app.post("/login")
 
 def login(request: LoginRequest):
 
     employee = EMPLOYEES.get(request.employee_id)
-
-
 
     if not employee:
 
@@ -1856,8 +1727,6 @@ def login(request: LoginRequest):
 
         )
 
-
-
     if request.password != employee["password"]:
 
         raise HTTPException(
@@ -1868,8 +1737,6 @@ def login(request: LoginRequest):
 
         )
 
-
-
     token = create_access_token(
 
         request.employee_id,
@@ -1877,8 +1744,6 @@ def login(request: LoginRequest):
         employee,
 
     )
-
-
 
     return {
 
@@ -1896,19 +1761,11 @@ def login(request: LoginRequest):
 
     }
 
-
-
-
-
 @app.get("/me")
 
 def me(user=Depends(get_current_user)):
 
     return user
-
-
-
-
 
 @app.get("/rbac")
 
@@ -1922,11 +1779,7 @@ def rbac(user=Depends(get_current_user)):
 
     """
 
-
-
     rules = get_rbac_rules_for_role(user["role"])
-
-
 
     return {
 
@@ -1938,10 +1791,6 @@ def rbac(user=Depends(get_current_user)):
 
     }
 
-
-
-
-
 @app.get("/gemini-status")
 def gemini_status():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -1950,112 +1799,37 @@ def gemini_status():
         "model": GEMINI_MODEL,
     }
 
-
 @app.post("/chat")
-
-def chat(
-
-    request: ChatRequest,
-
-    user=Depends(get_current_user),
-
-):
-
+def chat(request: ChatRequest, user=Depends(get_current_user)):
     question = request.question.strip()
-
-
-
     if not question:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail="Question cannot be empty.",
-
-        )
-
-
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     role = user["role"]
-
     region = user["region"]
 
-
-
-    # --------------------------------------------------------
-
-    # STEP 1 — Sensitive-topic gate
-
-    # --------------------------------------------------------
-
-
-
     sensitive_matches = detect_sensitive_topic(question)
-
-
-
     if sensitive_matches:
-
-        return {
-
-            "status": "escalated",
-
-            "answer": (
-
-                "This question involves a sensitive HR topic. "
-
-                "Please contact Human Resources for assistance. "
-
-                "The HR Helpdesk bot does not provide advice on "
-
-                "this type of matter."
-
-            ),
-
-            "role": role,
-
-            "sensitive_topics": sensitive_matches,
-            "confidence": None,
-            "confidence_label": "Not applicable",
-
-            "sources": [],
-
-        }
-
-
-
-    # --------------------------------------------------------
-
-    # STEP 2 — ESCALATION / CONTACT ROUTING
-
-    # --------------------------------------------------------
+        response = build_sensitive_response(question, sensitive_matches)
+        response["role"] = role
+        log_audit_event(
+            user, question, response["status"], response.get("confidence"),
+            response.get("sources"), sensitive_matches
+        )
+        return response
 
     if is_escalation_question(question):
-        escalation = build_escalation_response(question)
-        escalation["role"] = role
-        return escalation
-
-
-    # --------------------------------------------------------
-
-    # STEP 3 — RBAC QUESTION ROUTING
-
-    # --------------------------------------------------------
-
-    # Access/permission/approval questions use the explicit
-
-    # RBAC rules instead of guessing from ordinary policy text.
-
-
+        response = build_escalation_response(question)
+        response["role"] = role
+        log_audit_event(
+            user, question, response["status"], response.get("confidence"),
+            response.get("sources")
+        )
+        return response
 
     if is_rbac_question(question):
-
-        # Never disclose another role's RBAC rules to the current user.
-        # Example: an Intern asking "What can a VP access?" must not
-        # retrieve VP rules just because the question contains "VP".
         if has_cross_role_rbac_request(question, role):
-            return {
+            response = {
                 "status": "answered",
                 "answer": (
                     "I can only provide access-control information applicable "
@@ -2063,205 +1837,96 @@ def chat(
                     "role-specific permissions for other employee roles."
                 ),
                 "role": role,
-                "confidence": 0,
+                "confidence": None,
                 "confidence_label": "Not applicable",
                 "sources": [],
             }
+            log_audit_event(user, question, response["status"], None, [])
+            return response
 
-        relevant_rbac_rules = retrieve_relevant_rbac_rules(
-            question,
-            role,
-        )
+        target_role = role
+        referenced = referenced_roles_in_question(question)
+        if role in {"ceo", "hr"} and referenced:
+            preferred = [
+                r for r in ["intern", "associate", "store_manager", "vp", "ceo", "hr"]
+                if r in referenced
+            ]
+            if preferred:
+                target_role = preferred[0]
 
-
+        relevant_rbac_rules = retrieve_relevant_rbac_rules(question, target_role)
 
         if relevant_rbac_rules:
-
-            answer = build_rbac_answer(
-
-                question,
-
-                role,
-
-                relevant_rbac_rules,
-
-            )
-
-
-
+            answer = build_rbac_answer(question, target_role, relevant_rbac_rules)
             sources = [
-
                 {
-
                     "type": "rbac",
-
                     "citation": make_rbac_citation(rule),
-
                     "rule_id": rule.get("rule_id"),
-
                     "data_or_action": rule.get("data_or_action"),
-
                 }
-
                 for rule in relevant_rbac_rules
-
             ]
-
-
-
-            return {
-
+            confidence = calculate_rbac_confidence(question, relevant_rbac_rules)
+            response = {
                 "status": "answered",
-
                 "answer": answer,
-
                 "role": role,
-
+                "confidence": confidence,
+                "confidence_label": confidence_label(confidence),
                 "sources": sources,
-                "confidence": calculate_rbac_confidence(question, relevant_rbac_rules),
-                "confidence_label": confidence_label(calculate_rbac_confidence(question, relevant_rbac_rules)),
-
             }
+            log_audit_event(user, question, response["status"], confidence, sources)
+            return response
 
-
-
-        return {
-
+        response = {
             "status": "no_answer",
-
             "answer": (
-
-                "I could not find an applicable access-control or "
-
-                "approval rule for your role. Please contact HR "
-
-                "for clarification."
-
+                "I could not find an applicable access-control or approval "
+                "rule for your role. Please contact HR for clarification."
             ),
-
             "role": role,
-
-            "sources": [],
             "confidence": 0,
             "confidence_label": "Very low",
-
+            "sources": [],
         }
+        log_audit_event(user, question, response["status"], 0, [])
+        return response
 
-
-
-    # --------------------------------------------------------
-
-    # STEP 4 — NORMAL POLICY/FAQ RETRIEVAL
-
-    # --------------------------------------------------------
-
-
-
-    authorized_policies, authorized_faq = retrieve_authorized_context(
-
-        question,
-
-        role,
-
-        region,
-
+    authorized_policies, authorized_faq, evidence = retrieve_authorized_context(
+        question, role, region, request.history
     )
 
-
-
-    # --------------------------------------------------------
-
-    # STEP 5 — No authorized context
-
-    # --------------------------------------------------------
-
-
-
     if not authorized_policies and not authorized_faq:
-
-        return {
-
+        response = {
             "status": "no_answer",
-
             "answer": (
-
-                "I could not find an authorized policy or FAQ "
-
-                "that answers this question. Please contact HR "
-
-                "for clarification."
-
+                "I could not find an authorized HR policy or FAQ that "
+                "answers this question. Please contact HR for clarification."
             ),
-
             "role": role,
-
-            "sources": [],
             "confidence": 0,
             "confidence_label": "Very low",
-
+            "sources": [],
         }
-
-
-
-    # --------------------------------------------------------
-
-    # STEP 6 — Gemini grounded answer generation
-
-    #
-
-    # Only authorized policy/FAQ rows are sent to Gemini.
-
-    # 
-
-    # --------------------------------------------------------
-
-
+        log_audit_event(user, question, response["status"], 0, [])
+        return response
 
     sources = []
-
-
-
     for row in authorized_policies:
-
-        sources.append(
-
-            {
-
-                "type": "policy",
-
-                "citation": make_policy_citation(row),
-
-                "chunk_id": row.get("chunk_id"),
-
-            }
-
-        )
-
-
-
+        sources.append({
+            "type": "policy",
+            "citation": make_policy_citation(row),
+            "chunk_id": row.get("chunk_id"),
+            "section": row.get("section"),
+        })
     for row in authorized_faq:
-
-        sources.append(
-
-            {
-
-                "type": "faq",
-
-                "citation": row.get(
-
-                    "question",
-
-                    row.get("faq_id", "HR FAQ"),
-
-                ),
-
-                "chunk_id": row.get("chunk_id"),
-
-            }
-
-        )
-
-
+        sources.append({
+            "type": "faq",
+            "citation": f"{row.get('category', 'HR FAQ')} · {row.get('intent', 'FAQ')}",
+            "chunk_id": row.get("chunk_id"),
+            "section": row.get("policy_section", ""),
+        })
 
     try:
         answer = generate_grounded_answer(
@@ -2271,28 +1936,37 @@ def chat(
             faq=authorized_faq,
         )
     except Exception as exc:
-        # Do not expose provider details or secrets to the employee.
         print(f"[HR-HELPDESK] CHAT GEMINI FAILURE: {type(exc).__name__}: {exc}", flush=True)
-        return {
+        response = {
             "status": "error",
             "answer": (
-                "I found relevant HR information, but I could not "
-                "generate the answer right now. Please try again or "
-                "contact HR if the issue continues."
+                "I found relevant HR evidence, but the answer-generation "
+                "service is unavailable right now. Please try again."
             ),
             "role": role,
-            "confidence": 0,
-            "confidence_label": "Very low",
+            "confidence": None,
+            "confidence_label": "Not applicable",
             "sources": sources[:5],
         }
+        log_audit_event(user, question, response["status"], None, response["sources"])
+        return response
 
     confidence = calculate_retrieval_confidence(
-        question,
-        authorized_policies,
-        authorized_faq,
+        question, authorized_policies, authorized_faq, evidence
     )
 
-    return {
+    if any(
+        phrase in answer.lower()
+        for phrase in [
+            "does not provide an answer",
+            "does not provide enough information",
+            "cannot answer using the provided information",
+            "contact hr for clarification",
+        ]
+    ):
+        confidence = min(confidence, 45)
+
+    response = {
         "status": "answered",
         "answer": answer,
         "role": role,
@@ -2300,3 +1974,14 @@ def chat(
         "confidence_label": confidence_label(confidence),
         "sources": sources[:5],
     }
+    log_audit_event(user, question, response["status"], confidence, response["sources"])
+    return response
+
+@app.get("/admin/metrics")
+def admin_metrics(user=Depends(require_hr)):
+    return build_admin_metrics()
+
+@app.get("/admin/audit/recent")
+def admin_recent_audit(user=Depends(require_hr)):
+    events = load_audit_events()
+    return {"events": events[-50:]}

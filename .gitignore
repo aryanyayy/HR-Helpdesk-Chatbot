@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+api.txt
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+backend/vector_db/
+backend/audit_logs.jsonl
