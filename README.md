@@ -100,6 +100,13 @@ python -m streamlit run app.py
 ```
 
 Open [http://localhost:8501](http://localhost:8501) in your browser.
+The login interface should look like this:
+<img width="1870" height="572" alt="{D0D2BC56-E864-4ED7-8AA1-EFFC506B9E31}" src="https://github.com/user-attachments/assets/0e79bead-c9e6-4f0e-b874-543f24e88489" />
+
+The Chatbot interface should look like this:
+<img width="1831" height="955" alt="{B6531AA0-1BA6-4EA8-A999-DB6C00CBDFBB}" src="https://github.com/user-attachments/assets/89854aca-1f40-478d-bfeb-b3e7f09c852b" />
+
+
 
 ## Security Notes
 
